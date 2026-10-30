@@ -1,0 +1,182 @@
+# Power Query Steps
+
+How the raw GBIF download was turned into the clean table used by the Power Pivot data model.
+
+## Overview
+
+| Query | Purpose |
+| --- | --- |
+| `Raw_data` | Loads the raw GBIF file and cleans text |
+| `gbif_lookup` | Builds the unique list of scientific names to send to GBIF |
+| `species_match` | Loads the GBIF Species Lookup results |
+| `cleaned_data` | Merges the results back, fills blanks, fixes dates, keeps the analysis columns |
+
+**Why this approach:** many records have blank phylum, class, order or family, but `scientificName` is always filled. Instead of fixing rows one at a time, the unique names are matched once against GBIF’s taxonomy and the results are merged back, so every taxonomy column is filled in a single pass.
+
+> Replace file paths and column names with those in your own files. The instructions below shows the shape of each step. The Power Query window generates most of it for you when you use the ribbon commands.
+> 
+
+---
+
+## Step 1: Load the raw data (`Raw_data`)
+
+1. **Data > Get Data > From File > From Text/CSV**, choose the GBIF download, and click **Transform Data**.
+2. GBIF downloads are usually tab-delimited. Check that the first row is used as headers.
+
+---
+
+## Step 2: Standardise text and blanks
+
+Blanks arrive in several forms (empty cells, spaces). Trim the text and convert empty values to real nulls so they can be tested reliably.
+
+1. Select `phylum`, `class`, `order`, `family`, `genus`, `species`, `scientificName`.
+2. **Transform > Format > Trim**.
+3. **Transform > Replace Values**: replace an empty value with `null` in the taxonomy columns.
+
+---
+
+## Step 3: Flag rows that need taxonomy filled
+
+Add a custom column `needs_lookup` that is true when any of the four ranks is blank. Nothing is deleted or moved.
+
+```objectivec
+Flagged = Table.AddColumn(
+    Nulled, "needs_lookup",
+    each [phylum] = null or [class] = null or [order] = null or [family] = null,
+    type logical
+)
+```
+
+---
+
+## Step 4: Build the unique name list (`gbif_lookup`)
+
+Create a **separate query** so the main data keeps all its columns. In the Queries pane, right-click `Raw_data` and choose **Reference**, then:
+
+1. Filter `needs_lookup` to **TRUE**.
+2. Right-click `scientificName` > **Remove Other Columns**.
+3. **Home > Remove Rows > Remove Duplicates**.
+4. **Close & Load To** a new worksheet.
+
+---
+
+## Step 5: Match the names with GBIF
+
+This step is done outside Excel.
+
+1. Save the `gbif_lookup` sheet as **CSV UTF-8** (only the active sheet is saved).
+2. Upload it to GBIF’s **Species Lookup** tool (`gbif.org/tools/species-lookup`).
+3. Download the results file. It returns each name with GBIF’s matched classification (phylum, class, order, family) and match information.
+
+**Check the matches:** exact matches are safe. Fuzzy or higher-rank matches deserve a manual look, and names GBIF cannot match stay as `Unknown`.
+
+---
+
+## Step 6: Load the GBIF results (`species_match`)
+
+1. **Data > Get Data > From File > From Text/CSV**, choose the results file, and click **Transform Data**.
+2. Identify the column holding your **original name exactly as uploaded**. This is the one to merge on, not GBIF’s matched name, because GBIF may change the matched name (for example by removing the author or replacing a synonym).
+3. Keep only that column plus `phylum`, `class`, `order`, `family` (**Remove Other Columns**).
+4. Rename the four taxonomy columns to `phylum_gbif`, `class_gbif`, `order_gbif`, `family_gbif`.
+5. **Remove Duplicates** on the name column so the merge cannot add extra rows.
+
+---
+
+## Step 7: Merge the results into the main data
+
+In `cleaned_data` (built from `Flagged`):
+
+1. **Home > Merge Queries**. Select `scientificName` in the main table and the original-name column in `species_match`.
+2. Join kind: **Left Outer** (all rows from the main data).
+3. Check that the match message at the bottom shows most rows matched.
+4. Expand the new column and tick the four `_gbif` columns, with **Use original column name as prefix** unticked.
+
+> `scientificName_original` stands for whatever the original-name column is called in your results file.
+> 
+
+---
+
+## Step 8: Fill only the blanks
+
+Keep the original value when there is one. Otherwise use the GBIF value, and label anything still missing as `Unknown`.
+
+```objectivec
+PhylumFinal = Table.AddColumn(
+    Expanded, "phylum_final",
+    each if [phylum] = null or [phylum] = ""
+         then ([phylum_gbif] ?? "Unknown")
+         else [phylum],
+    type text
+),
+ClassFinal = Table.AddColumn(
+    PhylumFinal, "class_final",
+    each if [class] = null or [class] = ""
+         then ([class_gbif] ?? "Unknown")
+         else [class],
+    type text
+),
+OrderFinal = Table.AddColumn(
+    ClassFinal, "order_final",
+    each if [order] = null or [order] = ""
+         then ([order_gbif] ?? "Unknown")
+         else [order],
+    type text
+),
+FamilyFinal = Table.AddColumn(
+    OrderFinal, "family_final",
+    each if [family] = null or [family] = ""
+         then ([family_gbif] ?? "Unknown")
+         else [family],
+    type text
+)
+```
+
+**Order matters:** create all four `_final` columns first, then remove the old columns. Each step is calculated in sequence, so removing columns later does not change the values already calculated.
+
+Then:
+
+1. Remove the original `phylum`, `class`, `order`, `family` and the four `_gbif` columns.
+2. Rename the `_final` columns back to `phylum`, `class`, `order`, `family`.
+
+---
+
+## Step 9: Fix the event date
+
+`eventDate` arrives as a timestamp such as `2020-05-14T00:00:00Z`.
+
+1. **Transform > Split Column > By Delimiter**, delimiter `T`, **Left-most delimiter**.
+2. Delete the second column (the time and `Z`) and rename the first back to `eventDate`.
+3. Change its type to **Date**.
+
+Rows with errors are usually incomplete dates (only a year) or date ranges. Check them and decide whether to keep them as text or remove them. The `year`, `month` and `day` columns are used for analysis, so `eventDate` is mainly for reference.
+
+---
+
+## Step 10: Keep the analysis columns
+
+Use **Home > Choose Columns** (or **Remove Other Columns**) to keep only:
+
+`gbifID, kingdom, phylum, class, order, family, genus, species, taxonRank, scientificName, stateProvince, occurrenceStatus, eventDate, day, month, year, basisOfRecord`
+
+**Columns removed and why:** identifiers (datasetKey, occurrenceID, publishingOrgKey, taxonKey, speciesKey), collector and institution details, licence and rights fields, coordinates (not used for mapping), data-quality flags (issue) and helper columns (`needs_lookup`).
+
+---
+
+## Step 11: Set data types and load
+
+| Columns | Type |
+| --- | --- |
+| year, month, day | Whole number |
+| eventDate | Date |
+| All other columns | Text |
+
+**Home > Close & Load To** the Data Model, or load as a table and add it to the Data Model in Power Pivot.
+
+---
+
+## Checks before using the data
+
+- The row count matches the raw data.
+- No error cells in `eventDate` or the four taxonomy columns.
+- Filter for `Unknown` to see how many records GBIF could not match.
+- `year` and `day` are whole numbers. The column `month` is changed from decimal to a text for easier visualization.
